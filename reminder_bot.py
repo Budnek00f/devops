@@ -1,15 +1,19 @@
 import logging
 import sqlite3
-from datetime import datetime, time, timedelta
+from datetime import datetime, time
 import schedule
 import time as t
 from dateutil import parser
+import spacy
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
 
 # Настройка логирования
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Загрузка русской модели spacy
+nlp = spacy.load("ru_core_news_sm")
 
 # Подключение к БД (SQLite)
 conn = sqlite3.connect('reminders.db', check_same_thread=False)
@@ -21,30 +25,53 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS reminders
                    reminder_time DATETIME)''')
 conn.commit()
 
+# Функция для парсинга текста с помощью spacy и dateutil
+def parse_reminder(text):
+    doc = nlp(text)
+    reminder_text = text
+    parsed_date = None
+
+    # Ищем дату или временные выражения
+    for ent in doc.ents:
+        if ent.label_ in ["DATE", "TIME"]:
+            try:
+                parsed_date = parser.parse(ent.text, fuzzy=True, dayfirst=True)
+                reminder_text = text.replace(ent.text, "").strip()
+                break
+            except ValueError:
+                continue
+
+    # Если дата не найдена, пробуем dateutil
+    if not parsed_date:
+        try:
+            parsed_date = parser.parse(text, fuzzy=True, dayfirst=True)
+            reminder_text = text.replace(parsed_date.strftime('%d %B'), '').strip()
+        except ValueError:
+            return None, None
+
+    # Если время не указано, ставим 9:00 утра
+    if parsed_date.time() == time(0, 0):
+        parsed_date = parsed_date.replace(hour=9, minute=0)
+
+    return reminder_text, parsed_date
+
 # Функция для добавления напоминания
 async def add_reminder(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
     text = update.message.text.strip()
 
-    # Простой парсинг: ищем дату в сообщении (например, "поздравить деда 18 октября")
-    try:
-        # Парсим дату из текста
-        parsed_date = parser.parse(text, fuzzy=True, dayfirst=True)  # fuzzy=True для нестрогого парсинга
-        reminder_text = text.replace(parsed_date.strftime('%d %B'), '').strip()  # Удаляем дату из текста
+    reminder_text, parsed_date = parse_reminder(text)
 
-        # Если время не указано, устанавливаем утро (9:00)
-        if parsed_date.time() == time(0, 0):
-            parsed_date = parsed_date.replace(hour=9, minute=0)
+    if not parsed_date:
+        await update.message.reply_text("Не удалось распознать дату. Пример: 'поздравить деда 18 октября' или 'купить молоко в пятницу в 10:00'.")
+        return
 
-        # Сохраняем в БД
-        cursor.execute("INSERT INTO reminders (user_id, reminder_text, reminder_time) VALUES (?, ?, ?)",
-                       (user_id, reminder_text, parsed_date))
-        conn.commit()
+    # Сохраняем в БД
+    cursor.execute("INSERT INTO reminders (user_id, reminder_text, reminder_time) VALUES (?, ?, ?)",
+                   (user_id, reminder_text, parsed_date))
+    conn.commit()
 
-        await update.message.reply_text(f"Напоминание сохранено: '{reminder_text}' на {parsed_date.strftime('%d %B %Y %H:%M')}")
-
-    except ValueError:
-        await update.message.reply_text("Не удалось распознать дату. Пример: 'поздравить деда 18 октября' или 'купить молоко завтра в 10:00'.")
+    await update.message.reply_text(f"Напоминание сохранено: '{reminder_text}' на {parsed_date.strftime('%d %B %Y %H:%M')}")
 
 # Функция для проверки и отправки напоминаний
 def check_reminders(context: CallbackContext):
@@ -61,7 +88,7 @@ def check_reminders(context: CallbackContext):
 
 # Команда /start
 async def start(update: Update, context: CallbackContext):
-    await update.message.reply_text("Привет! О чем и когда тебе напомнить ?")
+    await update.message.reply_text("Привет! Напиши напоминание с датой, например: 'поздравить деда 18 октября' или 'купить молоко в пятницу'.")
 
 # Основная функция
 def main():
